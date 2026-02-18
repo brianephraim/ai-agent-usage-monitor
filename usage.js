@@ -56,6 +56,50 @@ function formatTimeUntil(resetStr) {
   return `${CYAN}${resetStr}${RESET}`;
 }
 
+function parseClaudeResetToDate(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const now = new Date();
+  const year = now.getFullYear();
+  const monthNames = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+
+  let m = raw.match(/(\w{3})\s+(\d{1,2})\s+at\s+(\d{1,2})\s*(am|pm)/i);
+  if (m) {
+    const monthIdx = monthNames[m[1]];
+    if (monthIdx != null) {
+      let h = parseInt(m[3], 10);
+      if (m[4].toLowerCase() === "pm" && h < 12) h += 12;
+      else if (m[4].toLowerCase() === "am" && h === 12) h = 0;
+      const d = new Date(year, monthIdx, parseInt(m[2], 10), h, 0, 0);
+      return d > now ? d : new Date(year + 1, monthIdx, parseInt(m[2], 10), h, 0, 0);
+    }
+  }
+
+  m = raw.match(/(\w{3})\s+(\d{1,2})(?:\s|$|\))/);
+  if (m) {
+    const monthIdx = monthNames[m[1]];
+    if (monthIdx != null) {
+      const d = new Date(year, monthIdx, parseInt(m[2], 10), 12, 0, 0);
+      return d > now ? d : new Date(year + 1, monthIdx, parseInt(m[2], 10), 12, 0, 0);
+    }
+  }
+
+  m = raw.match(/(\d{1,2})\s*(am|pm)/i);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    if (m[2].toLowerCase() === "pm" && h < 12) h += 12;
+    else if (m[2].toLowerCase() === "am" && h === 12) h = 0;
+    const d = new Date(year, now.getMonth(), now.getDate(), h, 0, 0);
+    return d > now ? d : new Date(year, now.getMonth(), now.getDate() + 1, h, 0, 0);
+  }
+
+  return null;
+}
+
+function formatClaudeReset(raw) {
+  const date = parseClaudeResetToDate(raw);
+  return date ? formatResetDate(date) : raw;
+}
+
 function heading(text) {
   const line = "─".repeat(60);
   return `\n${DIM}${line}${RESET}\n${BOLD}${text}${RESET}\n${DIM}${line}${RESET}`;
@@ -1016,11 +1060,16 @@ function displayClaude(data) {
       "Session  ",
       data.session_used_pct,
       "Resets",
-      data.session_resets
+      data.session_resets ? formatClaudeReset(data.session_resets) : data.session_resets
     )
   );
   console.log(
-    sectionRow("Weekly   ", data.week_used_pct, "Resets", data.week_resets)
+    sectionRow(
+      "Weekly   ",
+      data.week_used_pct,
+      "Resets",
+      data.week_resets ? formatClaudeReset(data.week_resets) : data.week_resets
+    )
   );
 
   if (data.extra_used_pct != null) {
@@ -1033,7 +1082,7 @@ function displayClaude(data) {
         `Extra    `,
         data.extra_used_pct,
         "Resets",
-        data.extra_resets
+        data.extra_resets ? formatClaudeReset(data.extra_resets) : data.extra_resets
       )
     );
     if (spent) {
