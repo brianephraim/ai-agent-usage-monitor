@@ -82,14 +82,16 @@ function fetchClaudeUsage() {
       return;
     }
 
+    const debug = process.env.CLAUDE_USAGE_DEBUG === "1" || process.env.CLAUDE_USAGE_DEBUG === "true";
     const timeoutEnv = Number(process.env.CLAUDE_USAGE_TIMEOUT_MS);
     const timeoutMs =
       Number.isFinite(timeoutEnv) && timeoutEnv >= 5000 && timeoutEnv <= 120000
         ? timeoutEnv
-        : 20000;
+        : 35000;
 
     const child = spawn(expectScript, [], {
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, TERM: process.env.TERM || "xterm-256color" },
     });
 
     let out = "";
@@ -101,13 +103,47 @@ function fetchClaudeUsage() {
       child.kill("SIGKILL");
     }, timeoutMs);
 
-    child.on("exit", (code) => {
+    const hasUsageData = () =>
+      /Current session|Current week|\d+%\s*used/i.test(out);
+
+    child.on("exit", (code, signal) => {
       clearTimeout(timer);
-      if (code !== 0 && !out.includes("Current session")) {
-        resolve({
-          error: `expect script exited ${code}: ${err.slice(0, 200)}`,
-        });
+      if (code !== 0 && !hasUsageData()) {
+        const exitDesc =
+          signal === "SIGKILL"
+            ? "timed out (killed by SIGKILL)"
+            : signal
+              ? `killed by ${signal}`
+              : `exited ${code}`;
+        let errorMsg = `expect script ${exitDesc}${err ? `: ${err.slice(0, 200)}` : ""}`;
+        if (debug) {
+          const debugPath = path.join(__dirname, ".claude-usage-debug.txt");
+          const envInfo = [
+            `TERM=${process.env.TERM}`,
+            `SHELL=${process.env.SHELL}`,
+            `PATH (first 3): ${(process.env.PATH || "").split(path.delimiter).slice(0, 3).join(path.delimiter)}`,
+            `Exit: code=${code} signal=${signal}`,
+            "",
+            "--- stdout ---",
+            out,
+            "",
+            "--- stderr ---",
+            err,
+          ].join("\n");
+          fs.writeFileSync(debugPath, envInfo, "utf8");
+          errorMsg += `\n  Debug output written to ${debugPath}`;
+        }
+        resolve({ error: errorMsg });
         return;
+      }
+
+      if (debug && (code !== 0 || !hasUsageData())) {
+        const debugPath = path.join(__dirname, ".claude-usage-debug.txt");
+        fs.writeFileSync(
+          debugPath,
+          [`Exit: code=${code} signal=${signal}`, "", "--- stdout ---", out, "", "--- stderr ---", err].join("\n"),
+          "utf8"
+        );
       }
 
       const parsed = parseClaudeUsage(out);
@@ -1242,7 +1278,8 @@ ${DIM}Services:${RESET}
   Cursor        Fetches Plan & Usage via api2.cursor.sh DashboardService using Cursor desktop auth (or CURSOR_ACCESS_TOKEN)
 
 ${DIM}Env overrides:${RESET}
-  CLAUDE_USAGE_TIMEOUT_MS  Override Claude collector timeout (default 20000, range 5000-120000)
+  CLAUDE_USAGE_TIMEOUT_MS  Override Claude collector timeout (default 35000, range 5000-120000)
+  CLAUDE_USAGE_DEBUG=1     On Claude error, write full output to .claude-usage-debug.txt
 `);
     return;
   }

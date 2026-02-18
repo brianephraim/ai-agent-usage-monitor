@@ -40,20 +40,40 @@ expect {
 
 # --- Phase 2: Open /usage ---
 send "/usage"
-after 200
-send "\r"
-after 200
+# Wait for autocomplete to appear before Enter (timing varies by terminal).
+# Some terminals show autocomplete slowly; sending Enter too soon does nothing.
+# Match flexibly since ANSI codes can appear between words.
+set timeout 8
+expect {
+  -re {Show.*plan|plan.*usage|usage.*limits} {
+    after 400
+    send "\r"
+  }
+  timeout {
+    # No autocomplete seen; send Enter anyway (minimal UI or fast env)
+    after 300
+    send "\r"
+  }
+}
+set timeout 15
+after 500
 send "\r"
 
-# Wait until usage sections show up. This is less brittle than matching one footer line.
+# Wait until usage sections show up. Allow extra time for "Loading usage data…".
+# Match multiple patterns since ANSI escape codes can break "Current session".
+set timeout 25
 expect {
   -re {Current session} {}
+  -re {Current week} {}
+  -re {[0-9]+%\s*used} {}
+  -re {\$[0-9]+\.[0-9]{2}.*spent} {}
   timeout {
     puts "\n[clock format [clock seconds]] Timed out waiting for usage screen."
     force_shutdown $pid
     exit 2
   }
 }
+set timeout 15
 
 # Allow trailing lines (e.g., week/extra usage and resets) to flush.
 after 700
