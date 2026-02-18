@@ -1,0 +1,15 @@
+{
+  "name": "ai-agent-usage-monitor",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "usage.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  }
+}

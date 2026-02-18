@@ -1,0 +1,93 @@
+#!/usr/bin/expect -f
+set timeout 30
+log_user 1
+
+# Make terminal behavior more predictable for TUIs
+set env(TERM) "xterm-256color"
+
+proc force_shutdown {pid} {
+  # Try all common shutdown paths on macOS/Linux.
+  catch { exec pkill -TERM -P $pid }
+  catch { exec kill -TERM $pid }
+  catch { exec kill -TERM -$pid }
+  after 300
+  catch { exec pkill -KILL -P $pid }
+  catch { exec kill -KILL $pid }
+  catch { exec kill -KILL -$pid }
+}
+
+spawn sh -lc "exec claude"
+set pid [exp_pid]
+
+# --- Phase 1: Wait until Claude prints something we recognize ---
+expect {
+  -re {Claude Code} {}
+  -re {Welcome back} {}
+  -re {❯\s} {}
+  -re {\?\s+for\s+shortcuts} {}
+  timeout {
+    puts "\n[clock format [clock seconds]] Timed out waiting for Claude UI to appear."
+    force_shutdown $pid
+    exit 1
+  }
+}
+
+# --- Phase 2: Open /usage ---
+send "/usage"
+after 200
+send "\r"
+after 200
+send "\r"
+
+# Wait until usage sections show up. This is less brittle than matching one footer line.
+expect {
+  -re {Current session} {}
+  timeout {
+    puts "\n[clock format [clock seconds]] Timed out waiting for usage screen."
+    force_shutdown $pid
+    exit 2
+  }
+}
+
+# Allow trailing lines (e.g., week/extra usage and resets) to flush.
+after 2000
+
+# --- Phase 3: Leave usage UI and exit Claude cleanly if possible ---
+set exited 0
+send "\033"
+after 150
+send "/exit\r"
+after 150
+send "/quit\r"
+
+set timeout 5
+expect {
+  eof { set exited 1 }
+  timeout {}
+}
+
+if {!$exited} {
+  send "\003"
+  after 200
+  send "\004"
+  set timeout 3
+  expect {
+    eof { set exited 1 }
+    timeout {}
+  }
+}
+
+if {!$exited} {
+  force_shutdown $pid
+  set timeout 2
+  expect {
+    eof {}
+    timeout {}
+  }
+}
+
+# Clean up expect bookkeeping
+catch { close }
+catch { wait -i $spawn_id }
+
+exit 0
