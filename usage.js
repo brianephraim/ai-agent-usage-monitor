@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { spawn, execSync } = require("node:child_process");
+const { spawn, execSync, execFileSync } = require("node:child_process");
 const https = require("node:https");
 const path = require("node:path");
 const fs = require("node:fs");
@@ -63,7 +63,9 @@ function heading(text) {
 
 function sectionRow(label, pctOrValue, resetLabel, resetValue) {
   const pctStr =
-    typeof pctOrValue === "number" ? progressBar(pctOrValue) : pctOrValue;
+    typeof pctOrValue === "number" || pctOrValue == null
+      ? progressBar(pctOrValue)
+      : pctOrValue;
   const parts = [`  ${BOLD}${label}${RESET}  ${pctStr}`];
   if (resetLabel) {
     parts.push(`    ${DIM}${resetLabel}:${RESET} ${formatTimeUntil(resetValue)}`);
@@ -444,73 +446,153 @@ function parseCodexWhamUsage(data) {
 // ─── Cursor: fetch via API ───────────────────────────────────────────────────
 function fetchCursorUsage(config) {
   return new Promise((resolve) => {
-    const token = config.cursor_session_token;
-    if (!token) {
+    const credentials = readCursorCredentials(config);
+    if (!credentials?.access_token) {
       resolve({
         error:
-          "No Cursor session token configured. Run with --setup to configure.",
+          "No Cursor auth token found. Open Cursor and sign in, or set CURSOR_ACCESS_TOKEN / cursor_access_token.",
       });
       return;
     }
 
-    // First get user ID
-    const authOptions = {
-      hostname: "www.cursor.com",
-      path: "/api/auth/me",
-      method: "GET",
-      headers: {
-        Cookie: `WorkosCursorSessionToken=${token}`,
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        Accept: "application/json",
-      },
-    };
-
-    const req = https.request(authOptions, (res) => {
-      let body = "";
-      res.on("data", (d) => (body += d));
-      res.on("end", () => {
-        if (res.statusCode !== 200) {
-          resolve({
-            error: `Cursor auth returned ${res.statusCode}. Token may have expired. Run with --setup to reconfigure.`,
-          });
+    fetchCursorApiJson(credentials.access_token, "/auth/usage").then(
+      (usageResponse) => {
+        if (usageResponse.error) {
+          resolve({ error: usageResponse.error });
           return;
         }
-        try {
-          const authData = JSON.parse(body);
-          const userId =
-            authData.id || authData.sub || authData.user_id || authData.email;
-          if (!userId) {
-            resolve({ error: "Could not determine Cursor user ID" });
-            return;
-          }
-          fetchCursorUsageData(token, userId).then(resolve);
-        } catch (e) {
-          resolve({ error: `Failed to parse Cursor auth: ${e.message}` });
+
+        const parsed = parseCursorUsage(usageResponse.data);
+        parsed.auth_source = credentials.source;
+
+        if (credentials.membership_type) {
+          parsed.plan = String(credentials.membership_type);
         }
-      });
-    });
-    req.on("error", (e) =>
-      resolve({ error: `Cursor auth request failed: ${e.message}` })
+        if (credentials.subscription_status) {
+          parsed.subscription_status = String(credentials.subscription_status);
+        }
+
+        fetchCursorApiJson(credentials.access_token, "/auth/full_stripe_profile")
+          .then((profileResponse) => {
+            if (!profileResponse.error && profileResponse.data) {
+              const profile = profileResponse.data;
+              const membership =
+                profile.membershipType || profile.individualMembershipType;
+              const details = [];
+              if (profile.isYearlyPlan) details.push("yearly");
+              if (profile.isOnStudentPlan) details.push("student");
+
+              if (membership) {
+                parsed.plan =
+                  details.length > 0
+                    ? `${membership} ${details.join(" ")}`
+                    : String(membership);
+              }
+              if (profile.subscriptionStatus) {
+                parsed.subscription_status = String(profile.subscriptionStatus);
+              }
+            }
+            resolve(parsed);
+          })
+          .catch(() => resolve(parsed));
+      }
     );
-    req.setTimeout(10000, () => {
-      req.destroy();
-      resolve({ error: "Cursor auth request timed out" });
-    });
-    req.end();
   });
 }
 
-function fetchCursorUsageData(token, userId) {
+function cursorStateDbPaths() {
+  const cursorUserDir = path.join(
+    os.homedir(),
+    "Library",
+    "Application Support",
+    "Cursor",
+    "User"
+  );
+  const paths = [path.join(cursorUserDir, "globalStorage", "state.vscdb")];
+  const profilesDir = path.join(cursorUserDir, "profiles");
+  try {
+    for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      paths.push(
+        path.join(
+          profilesDir,
+          entry.name,
+          "globalStorage",
+          "state.vscdb"
+        )
+      );
+    }
+  } catch {
+    // no-op
+  }
+  return [...new Set(paths)];
+}
+
+function readCursorStateValue(dbPath, key) {
+  try {
+    const safeKey = key.replace(/'/g, "''");
+    const query = `SELECT value FROM ItemTable WHERE key='${safeKey}' LIMIT 1;`;
+    const out = execFileSync("sqlite3", [dbPath, query], {
+      encoding: "utf8",
+      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+function readCursorCredentials(config) {
+  const envToken = process.env.CURSOR_ACCESS_TOKEN?.trim();
+  if (envToken) {
+    return {
+      access_token: envToken,
+      source: "CURSOR_ACCESS_TOKEN",
+    };
+  }
+
+  const configuredToken =
+    typeof config.cursor_access_token === "string"
+      ? config.cursor_access_token.trim()
+      : "";
+  if (configuredToken) {
+    return {
+      access_token: configuredToken,
+      source: CONFIG_PATH,
+    };
+  }
+
+  for (const dbPath of cursorStateDbPaths()) {
+    if (!fs.existsSync(dbPath)) continue;
+    const accessToken = readCursorStateValue(dbPath, "cursorAuth/accessToken");
+    if (!accessToken) continue;
+    return {
+      access_token: accessToken,
+      source: dbPath,
+      membership_type: readCursorStateValue(
+        dbPath,
+        "cursorAuth/stripeMembershipType"
+      ),
+      subscription_status: readCursorStateValue(
+        dbPath,
+        "cursorAuth/stripeSubscriptionStatus"
+      ),
+    };
+  }
+
+  return null;
+}
+
+function fetchCursorApiJson(accessToken, apiPath) {
   return new Promise((resolve) => {
     const options = {
-      hostname: "www.cursor.com",
-      path: `/api/usage?user=${encodeURIComponent(userId)}`,
+      hostname: "api2.cursor.sh",
+      path: apiPath,
       method: "GET",
       headers: {
-        Cookie: `WorkosCursorSessionToken=${token}`,
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": "ai-agent-usage-monitor",
         Accept: "application/json",
       },
     };
@@ -519,26 +601,32 @@ function fetchCursorUsageData(token, userId) {
       let body = "";
       res.on("data", (d) => (body += d));
       res.on("end", () => {
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          resolve({
+            error:
+              "Cursor auth token expired or unauthorized. Open Cursor and sign in again.",
+          });
+          return;
+        }
         if (res.statusCode !== 200) {
           resolve({
-            error: `Cursor usage API returned ${res.statusCode}`,
+            error: `Cursor API ${apiPath} returned ${res.statusCode}`,
           });
           return;
         }
         try {
-          const data = JSON.parse(body);
-          resolve(parseCursorUsage(data));
+          resolve({ data: JSON.parse(body) });
         } catch (e) {
-          resolve({ error: `Failed to parse Cursor usage: ${e.message}` });
+          resolve({ error: `Failed to parse Cursor API ${apiPath}: ${e.message}` });
         }
       });
     });
     req.on("error", (e) =>
-      resolve({ error: `Cursor usage request failed: ${e.message}` })
+      resolve({ error: `Cursor API ${apiPath} request failed: ${e.message}` })
     );
     req.setTimeout(10000, () => {
       req.destroy();
-      resolve({ error: "Cursor usage request timed out" });
+      resolve({ error: `Cursor API ${apiPath} request timed out` });
     });
     req.end();
   });
@@ -553,6 +641,9 @@ function parseCursorUsage(data) {
     api_limit: null,
     api_used_pct: null,
     monthly_resets: null,
+    plan: null,
+    subscription_status: null,
+    auth_source: null,
   };
 
   // The Cursor usage API can return various structures
@@ -776,6 +867,19 @@ function displayCursor(data) {
     return;
   }
 
+  if (data.plan) {
+    const status = data.subscription_status
+      ? ` (${data.subscription_status})`
+      : "";
+    console.log(`  ${DIM}Plan:${RESET} ${data.plan}${status}`);
+  }
+
+  if (data.auth_source) {
+    console.log(
+      `  ${DIM}Auth source:${RESET} ${CYAN}${data.auth_source}${RESET}`
+    );
+  }
+
   const composerLabel = data.composer_model
     ? `Composer (${data.composer_model})`
     : "Composer ";
@@ -849,20 +953,19 @@ async function setup() {
 
   // Cursor
   console.log(`\n${BLUE}${BOLD}Cursor${RESET}`);
-  console.log(`  To get your session token:`);
-  console.log(`  1. Open ${CYAN}https://www.cursor.com${RESET} in your browser (logged in)`);
   console.log(
-    `  2. Open DevTools (F12) > Application > Cookies > cursor.com`
+    `  Uses Cursor desktop auth from local Cursor state (no cookie copy required).`
   );
   console.log(
-    `  3. Copy the value of ${CYAN}WorkosCursorSessionToken${RESET}\n`
+    `  Make sure you are signed in to Cursor.\n`
   );
   const cursorToken = await ask(
-    `  Paste Cursor session token (or press Enter to skip): `
+    `  Optional: paste Cursor access token override (or press Enter to auto-detect): `
   );
   if (cursorToken.trim()) {
-    config.cursor_session_token = cursorToken.trim();
+    config.cursor_access_token = cursorToken.trim();
   }
+  delete config.cursor_session_token;
 
   saveConfig(config);
   console.log(`\n${GREEN}Config saved to ${CONFIG_PATH}${RESET}\n`);
@@ -898,7 +1001,7 @@ ${DIM}Usage:${RESET}
 ${DIM}Services:${RESET}
   Claude Code   Uses expect to run /usage in the CLI (requires claude auth login)
   Codex         Fetches wham usage using Codex CLI OAuth (requires codex auth login)
-  Cursor        Fetches from cursor.com API (requires WorkosCursorSessionToken)
+  Cursor        Fetches from api2.cursor.sh/auth/usage using Cursor desktop auth (or CURSOR_ACCESS_TOKEN)
 `);
     return;
   }
