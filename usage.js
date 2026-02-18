@@ -82,6 +82,12 @@ function fetchClaudeUsage() {
       return;
     }
 
+    const timeoutEnv = Number(process.env.CLAUDE_USAGE_TIMEOUT_MS);
+    const timeoutMs =
+      Number.isFinite(timeoutEnv) && timeoutEnv >= 5000 && timeoutEnv <= 120000
+        ? timeoutEnv
+        : 20000;
+
     const child = spawn(expectScript, [], {
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -93,7 +99,7 @@ function fetchClaudeUsage() {
 
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-    }, 45000);
+    }, timeoutMs);
 
     child.on("exit", (code) => {
       clearTimeout(timer);
@@ -950,9 +956,19 @@ function formatUsdFromCents(cents) {
   return `$${(n / 100).toFixed(2)}`;
 }
 
+function formatElapsedSeconds(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n)) return "";
+  return `${DIM} (${n.toFixed(2)}s)${RESET}`;
+}
+
 // ─── Display ─────────────────────────────────────────────────────────────────
 function displayClaude(data) {
-  console.log(heading(`${MAGENTA}  Claude Code${RESET}`));
+  console.log(
+    heading(
+      `${MAGENTA}  Claude Code${RESET}${formatElapsedSeconds(data.elapsed_seconds)}`
+    )
+  );
 
   if (data.error) {
     console.log(`  ${RED}Error: ${data.error}${RESET}`);
@@ -991,7 +1007,11 @@ function displayClaude(data) {
 }
 
 function displayCodex(data) {
-  console.log(heading(`${GREEN}  Codex CLI${RESET}`));
+  console.log(
+    heading(
+      `${GREEN}  Codex CLI${RESET}${formatElapsedSeconds(data.elapsed_seconds)}`
+    )
+  );
 
   if (data.error) {
     console.log(`  ${RED}Error: ${data.error}${RESET}`);
@@ -1058,7 +1078,9 @@ function displayCodex(data) {
 }
 
 function displayCursor(data) {
-  console.log(heading(`${BLUE}  Cursor${RESET}`));
+  console.log(
+    heading(`${BLUE}  Cursor${RESET}${formatElapsedSeconds(data.elapsed_seconds)}`)
+  );
 
   if (data.error) {
     console.log(`  ${RED}Error: ${data.error}${RESET}`);
@@ -1218,6 +1240,9 @@ ${DIM}Services:${RESET}
   Claude Code   Uses expect to run /usage in the CLI (requires claude auth login)
   Codex         Fetches wham usage using Codex CLI OAuth (requires codex auth login)
   Cursor        Fetches Plan & Usage via api2.cursor.sh DashboardService using Cursor desktop auth (or CURSOR_ACCESS_TOKEN)
+
+${DIM}Env overrides:${RESET}
+  CLAUDE_USAGE_TIMEOUT_MS  Override Claude collector timeout (default 20000, range 5000-120000)
 `);
     return;
   }
@@ -1241,21 +1266,35 @@ ${DIM}Services:${RESET}
 
   // Run fetches in parallel
   const promises = {};
+  const startedAtMs = {};
 
   if (showAll || claudeOnly) {
+    startedAtMs.claude = Date.now();
     promises.claude = fetchClaudeUsage();
   }
   if (showAll || codexOnly) {
+    startedAtMs.codex = Date.now();
     promises.codex = fetchCodexUsage();
   }
   if (showAll || cursorOnly) {
+    startedAtMs.cursor = Date.now();
     promises.cursor = fetchCursorUsage(config);
   }
 
   const keys = Object.keys(promises);
   const values = await Promise.all(Object.values(promises));
   const results = {};
-  keys.forEach((k, i) => (results[k] = values[i]));
+  keys.forEach((k, i) => {
+    const elapsedSeconds = Number(
+      ((Date.now() - (startedAtMs[k] || Date.now())) / 1000).toFixed(2)
+    );
+    const value = values[i];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      results[k] = { ...value, elapsed_seconds: elapsedSeconds };
+    } else {
+      results[k] = { value, elapsed_seconds: elapsedSeconds };
+    }
+  });
 
   if (jsonMode) {
     outputJson(results.claude, results.codex, results.cursor);

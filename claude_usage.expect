@@ -1,5 +1,5 @@
 #!/usr/bin/expect -f
-set timeout 30
+set timeout 15
 log_user 1
 
 # Make terminal behavior more predictable for TUIs
@@ -56,40 +56,15 @@ expect {
 }
 
 # Allow trailing lines (e.g., week/extra usage and resets) to flush.
-after 2000
+after 700
 
-# --- Phase 3: Leave usage UI and exit Claude cleanly if possible ---
-set exited 0
-send "\033"
-after 150
-send "/exit\r"
-after 150
-send "/quit\r"
-
-set timeout 5
+# --- Phase 3: Fast shutdown ---
+# We only need the rendered usage text, so avoid long graceful-exit waits.
+force_shutdown $pid
+set timeout 2
 expect {
-  eof { set exited 1 }
+  eof {}
   timeout {}
-}
-
-if {!$exited} {
-  send "\003"
-  after 200
-  send "\004"
-  set timeout 3
-  expect {
-    eof { set exited 1 }
-    timeout {}
-  }
-}
-
-if {!$exited} {
-  force_shutdown $pid
-  set timeout 2
-  expect {
-    eof {}
-    timeout {}
-  }
 }
 
 # Clean up expect bookkeeping
