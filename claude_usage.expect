@@ -5,6 +5,12 @@ log_user 1
 # Make terminal behavior more predictable for TUIs
 set env(TERM) "xterm-256color"
 
+# Remove parent-session env vars so claude uses the locally-stored auth
+# (the one from `claude auth login` in a standalone terminal)
+foreach var {ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL CLAUDECODE CLAUDE_AGENT_SDK_VERSION CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES} {
+  catch {unset env($var)}
+}
+
 proc force_shutdown {pid} {
   # Try all common shutdown paths on macOS/Linux.
   catch { exec pkill -TERM -P $pid }
