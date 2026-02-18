@@ -56,6 +56,46 @@ function formatTimeUntil(resetStr) {
   return `${CYAN}${resetStr}${RESET}`;
 }
 
+/** Compute hot/cold vs pace: equilibrium = (elapsed/term) * limit. Returns { status, pct } or null. */
+function computeHotCold(pctUsed, resetAtMs, termDurationMs) {
+  if (
+    pctUsed == null ||
+    !Number.isFinite(pctUsed) ||
+    !Number.isFinite(resetAtMs) ||
+    !Number.isFinite(termDurationMs) ||
+    termDurationMs <= 0
+  ) {
+    return null;
+  }
+  const now = Date.now();
+  if (now >= resetAtMs) return null;
+  const termStart = resetAtMs - termDurationMs;
+  const elapsed = now - termStart;
+  if (elapsed <= 0) return null;
+  const pctTimeElapsed = (elapsed / termDurationMs) * 100;
+  if (pctTimeElapsed < 1) return null;
+  const delta = pctUsed - pctTimeElapsed;
+  const pctOverUnder = (delta / pctTimeElapsed) * 100;
+  if (Math.abs(pctOverUnder) < 5) {
+    return { status: "equilibrium", pct: 0 };
+  }
+  if (delta > 0) {
+    return { status: "hot", pct: Math.round(pctOverUnder) };
+  }
+  return { status: "cold", pct: Math.round(Math.abs(pctOverUnder)) };
+}
+
+function formatHotCold(result) {
+  if (!result) return null;
+  if (result.status === "equilibrium") {
+    return `    ${DIM}Pace:${RESET} ${GREEN}on pace${RESET}`;
+  }
+  if (result.status === "hot") {
+    return `    ${DIM}Pace:${RESET} ${RED}${result.pct}% over pace${RESET}`;
+  }
+  return `    ${DIM}Pace:${RESET} ${GREEN}${result.pct}% under pace${RESET}`;
+}
+
 function parseClaudeResetToDate(raw) {
   if (!raw || typeof raw !== "string") return null;
   const now = new Date();
@@ -457,13 +497,21 @@ function parseCodexWhamUsage(data) {
     primary_label: null,
     primary_used_pct: null,
     primary_resets: null,
+    primary_reset_at_ms: null,
+    primary_window_seconds: null,
     secondary_label: null,
     secondary_used_pct: null,
     secondary_resets: null,
+    secondary_reset_at_ms: null,
+    secondary_window_seconds: null,
     five_hour_used_pct: null,
     five_hour_resets: null,
+    five_hour_reset_at_ms: null,
+    five_hour_window_seconds: null,
     weekly_used_pct: null,
     weekly_resets: null,
+    weekly_reset_at_ms: null,
+    weekly_window_seconds: null,
     plan: null,
     credential_source: data?._credential_source ?? null,
   };
@@ -481,14 +529,20 @@ function parseCodexWhamUsage(data) {
     result.primary_label = toLabel(seconds, "Primary");
     result.primary_used_pct = pct;
     result.primary_resets = reset;
+    result.primary_reset_at_ms = primary.reset_at != null ? primary.reset_at * 1000 : null;
+    result.primary_window_seconds = Number.isFinite(seconds) ? seconds : null;
 
     if (Number.isFinite(seconds) && seconds <= 6 * 3600) {
       result.five_hour_used_pct = pct;
       result.five_hour_resets = reset;
+      result.five_hour_reset_at_ms = result.primary_reset_at_ms;
+      result.five_hour_window_seconds = result.primary_window_seconds;
     }
     if (Number.isFinite(seconds) && seconds >= 6 * 24 * 3600) {
       result.weekly_used_pct = pct;
       result.weekly_resets = reset;
+      result.weekly_reset_at_ms = result.primary_reset_at_ms;
+      result.weekly_window_seconds = result.primary_window_seconds;
     }
   }
 
@@ -502,14 +556,20 @@ function parseCodexWhamUsage(data) {
     result.secondary_label = toLabel(seconds, "Secondary");
     result.secondary_used_pct = pct;
     result.secondary_resets = reset;
+    result.secondary_reset_at_ms = secondary.reset_at != null ? secondary.reset_at * 1000 : null;
+    result.secondary_window_seconds = Number.isFinite(seconds) ? seconds : null;
 
     if (Number.isFinite(seconds) && seconds <= 6 * 3600) {
       result.five_hour_used_pct = pct;
       result.five_hour_resets = reset;
+      result.five_hour_reset_at_ms = result.secondary_reset_at_ms;
+      result.five_hour_window_seconds = result.secondary_window_seconds;
     }
     if (Number.isFinite(seconds) && seconds >= 6 * 24 * 3600) {
       result.weekly_used_pct = pct;
       result.weekly_resets = reset;
+      result.weekly_reset_at_ms = result.secondary_reset_at_ms;
+      result.weekly_window_seconds = result.secondary_window_seconds;
     }
   }
 
@@ -808,7 +868,10 @@ function applyCursorPlanInfo(parsed, planInfoResponse) {
 
   const billingCycleEnd = Number(planInfo.billingCycleEnd);
   if (Number.isFinite(billingCycleEnd) && billingCycleEnd > 0) {
-    parsed.monthly_resets = formatResetDate(new Date(billingCycleEnd));
+    const endMs = billingCycleEnd < 1e12 ? billingCycleEnd * 1000 : billingCycleEnd;
+    parsed.monthly_resets = formatResetDate(new Date(endMs));
+    parsed.monthly_reset_at_ms = endMs;
+    parsed.monthly_term_duration_ms = 30 * 24 * 60 * 60 * 1000;
   }
 }
 
@@ -910,9 +973,12 @@ function parseCursorUsage(data) {
   }
 
   if (data.billingCycleEnd) {
-    const endEpochMs = Number(data.billingCycleEnd);
-    if (Number.isFinite(endEpochMs) && endEpochMs > 0) {
-      result.monthly_resets = formatResetDate(new Date(endEpochMs));
+    const endEpoch = Number(data.billingCycleEnd);
+    if (Number.isFinite(endEpoch) && endEpoch > 0) {
+      const endMs = endEpoch < 1e12 ? endEpoch * 1000 : endEpoch;
+      result.monthly_resets = formatResetDate(new Date(endMs));
+      result.monthly_reset_at_ms = endMs;
+      result.monthly_term_duration_ms = 30 * 24 * 60 * 60 * 1000;
     }
   }
 
@@ -956,11 +1022,13 @@ function parseCursorUsage(data) {
   }
 
   // Monthly reset
-  if (data.startOfMonth) {
+  if (data.startOfMonth && !result.monthly_reset_at_ms) {
     const start = new Date(data.startOfMonth);
     const nextMonth = new Date(start);
     nextMonth.setMonth(nextMonth.getMonth() + 1);
     result.monthly_resets = formatResetDate(nextMonth);
+    result.monthly_reset_at_ms = nextMonth.getTime();
+    result.monthly_term_duration_ms = nextMonth.getTime() - start.getTime();
   }
 
   // If we got raw data but our parsing didn't match, include it for debugging
@@ -986,11 +1054,13 @@ function parseCursorUsage(data) {
         }
       }
     }
-    if (data.startOfMonth) {
+    if (data.startOfMonth && !result.monthly_reset_at_ms) {
       const start = new Date(data.startOfMonth);
       const nextMonth = new Date(start);
       nextMonth.setMonth(nextMonth.getMonth() + 1);
       result.monthly_resets = formatResetDate(nextMonth);
+      result.monthly_reset_at_ms = nextMonth.getTime();
+      result.monthly_term_duration_ms = nextMonth.getTime() - start.getTime();
     }
   }
 
@@ -1071,6 +1141,13 @@ function displayClaude(data) {
       data.week_resets ? formatClaudeReset(data.week_resets) : data.week_resets
     )
   );
+  const weekResetDate = data.week_resets ? parseClaudeResetToDate(data.week_resets) : null;
+  const weekPace = formatHotCold(
+    weekResetDate && data.week_used_pct != null
+      ? computeHotCold(data.week_used_pct, weekResetDate.getTime(), 7 * 24 * 60 * 60 * 1000)
+      : null
+  );
+  if (weekPace) console.log(weekPace);
 
   if (data.extra_used_pct != null) {
     const spent =
@@ -1085,6 +1162,13 @@ function displayClaude(data) {
         data.extra_resets ? formatClaudeReset(data.extra_resets) : data.extra_resets
       )
     );
+    const extraResetDate = data.extra_resets ? parseClaudeResetToDate(data.extra_resets) : null;
+    const extraPace = formatHotCold(
+      extraResetDate && data.extra_used_pct != null
+        ? computeHotCold(data.extra_used_pct, extraResetDate.getTime(), 30 * 24 * 60 * 60 * 1000)
+        : null
+    );
+    if (extraPace) console.log(extraPace);
     if (spent) {
       console.log(`    ${DIM}Spend:${RESET}  ${CYAN}${spent.trim()}${RESET}`);
     }
@@ -1124,6 +1208,12 @@ function displayCodex(data) {
         data.primary_resets
       )
     );
+    const primaryPace = formatHotCold(
+      data.primary_reset_at_ms != null && data.primary_window_seconds != null && data.primary_used_pct != null
+        ? computeHotCold(data.primary_used_pct, data.primary_reset_at_ms, data.primary_window_seconds * 1000)
+        : null
+    );
+    if (primaryPace) console.log(primaryPace);
   } else {
     console.log(
       sectionRow(
@@ -1133,6 +1223,12 @@ function displayCodex(data) {
         data.five_hour_resets
       )
     );
+    const fiveHourPace = formatHotCold(
+      data.five_hour_reset_at_ms != null && data.five_hour_window_seconds != null && data.five_hour_used_pct != null
+        ? computeHotCold(data.five_hour_used_pct, data.five_hour_reset_at_ms, data.five_hour_window_seconds * 1000)
+        : null
+    );
+    if (fiveHourPace) console.log(fiveHourPace);
   }
 
   if (hasSecondary) {
@@ -1144,6 +1240,12 @@ function displayCodex(data) {
         data.secondary_resets
       )
     );
+    const secondaryPace = formatHotCold(
+      data.secondary_reset_at_ms != null && data.secondary_window_seconds != null && data.secondary_used_pct != null
+        ? computeHotCold(data.secondary_used_pct, data.secondary_reset_at_ms, data.secondary_window_seconds * 1000)
+        : null
+    );
+    if (secondaryPace) console.log(secondaryPace);
   } else {
     console.log(
       sectionRow(
@@ -1153,6 +1255,12 @@ function displayCodex(data) {
         data.weekly_resets
       )
     );
+    const weeklyPace = formatHotCold(
+      data.weekly_reset_at_ms != null && data.weekly_window_seconds != null && data.weekly_used_pct != null
+        ? computeHotCold(data.weekly_used_pct, data.weekly_reset_at_ms, data.weekly_window_seconds * 1000)
+        : null
+    );
+    if (weeklyPace) console.log(weeklyPace);
   }
 
   if (data.credential_source) {
@@ -1196,11 +1304,23 @@ function displayCursor(data) {
       data.monthly_resets
     )
   );
+  const totalPace = formatHotCold(
+    data.monthly_reset_at_ms != null && data.monthly_term_duration_ms != null && totalPct != null
+      ? computeHotCold(totalPct, data.monthly_reset_at_ms, data.monthly_term_duration_ms)
+      : null
+  );
+  if (totalPace) console.log(totalPace);
 
   if (autoPct != null) {
     console.log(
       sectionRow("Auto     ", autoPct, "Monthly reset", data.monthly_resets)
     );
+    const autoPace = formatHotCold(
+      data.monthly_reset_at_ms != null && data.monthly_term_duration_ms != null
+        ? computeHotCold(autoPct, data.monthly_reset_at_ms, data.monthly_term_duration_ms)
+        : null
+    );
+    if (autoPace) console.log(autoPace);
   }
 
   if (data.api_used_pct != null || data.api_used != null || data.api_limit != null) {
@@ -1216,6 +1336,12 @@ function displayCursor(data) {
         data.monthly_resets
       )
     );
+    const apiPace = formatHotCold(
+      data.monthly_reset_at_ms != null && data.monthly_term_duration_ms != null && data.api_used_pct != null
+        ? computeHotCold(data.api_used_pct, data.monthly_reset_at_ms, data.monthly_term_duration_ms)
+        : null
+    );
+    if (apiPace) console.log(apiPace);
     if (apiDetail) {
       console.log(`    ${DIM}Requests:${RESET}${apiDetail}`);
     }
