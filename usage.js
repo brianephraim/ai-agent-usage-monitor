@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 const { spawn, execSync } = require("node:child_process");
 const https = require("node:https");
-const http = require("node:http");
 const path = require("node:path");
 const fs = require("node:fs");
+const os = require("node:os");
+const { createHash } = require("node:crypto");
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIG_PATH = path.join(__dirname, ".usage-config.json");
@@ -194,176 +195,246 @@ function parseClaudeUsage(text) {
   };
 }
 
-// ─── Codex: fetch via web dashboard scrape ───────────────────────────────────
-function fetchCodexUsage(config) {
+// ─── Codex: fetch via CLI OAuth credentials ──────────────────────────────────
+function resolveCodexHomePath() {
+  const configured = process.env.CODEX_HOME?.trim();
+  const home = configured || path.join(os.homedir(), ".codex");
+  try {
+    return fs.realpathSync.native(home);
+  } catch {
+    return home;
+  }
+}
+
+function computeCodexKeychainAccount(codexHome) {
+  const hash = createHash("sha256").update(codexHome).digest("hex");
+  return `cli|${hash.slice(0, 16)}`;
+}
+
+function decodeJwtPayload(token) {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    let payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (payload.length % 4) payload += "=";
+    return JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function extractCodexAccountIdFromToken(token) {
+  const payload = decodeJwtPayload(token);
+  const authClaim = payload?.["https://api.openai.com/auth"];
+  if (authClaim?.chatgpt_account_id) {
+    return String(authClaim.chatgpt_account_id);
+  }
+  return null;
+}
+
+function readCodexCliCredentials() {
+  const codexHome = resolveCodexHomePath();
+
+  if (process.platform === "darwin") {
+    try {
+      const account = computeCodexKeychainAccount(codexHome);
+      const secret = execSync(
+        `security find-generic-password -s "Codex Auth" -a "${account}" -w`,
+        {
+          encoding: "utf8",
+          timeout: 5000,
+          stdio: ["pipe", "pipe", "pipe"],
+        }
+      ).trim();
+      const parsed = JSON.parse(secret);
+      const tokens = parsed?.tokens;
+      if (tokens?.access_token) {
+        return {
+          access_token: String(tokens.access_token),
+          account_id:
+            typeof tokens.account_id === "string" ? tokens.account_id : null,
+          source: "macOS keychain",
+        };
+      }
+    } catch {
+      // Fallback to file-based auth below.
+    }
+  }
+
+  const authPath = path.join(codexHome, "auth.json");
+  try {
+    const raw = fs.readFileSync(authPath, "utf8");
+    const parsed = JSON.parse(raw);
+    const tokens = parsed?.tokens;
+    if (tokens?.access_token) {
+      return {
+        access_token: String(tokens.access_token),
+        account_id: typeof tokens.account_id === "string" ? tokens.account_id : null,
+        source: authPath,
+      };
+    }
+  } catch {
+    // no-op
+  }
+
+  return null;
+}
+
+function fetchCodexUsage() {
   return new Promise((resolve) => {
-    const cookies = config.codex_cookies;
-    if (!cookies) {
+    const credentials = readCodexCliCredentials();
+    if (!credentials?.access_token) {
       resolve({
         error:
-          "No Codex cookies configured. Run with --setup to configure, or set codex_cookies in .usage-config.json",
+          "No Codex CLI OAuth credentials found. Run `codex auth login` and retry.",
       });
       return;
     }
 
+    const accountId =
+      credentials.account_id ||
+      extractCodexAccountIdFromToken(credentials.access_token);
+
     const options = {
       hostname: "chatgpt.com",
-      path: "/backend-api/codex/rate_limits",
+      path: "/backend-api/wham/usage",
       method: "GET",
       headers: {
-        Cookie: cookies,
+        Authorization: `Bearer ${credentials.access_token}`,
         "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          "ai-agent-usage-monitor",
         Accept: "application/json",
       },
     };
+    if (accountId) {
+      options.headers["ChatGPT-Account-Id"] = accountId;
+    }
 
     const req = https.request(options, (res) => {
       let body = "";
       res.on("data", (d) => (body += d));
       res.on("end", () => {
-        if (res.statusCode !== 200) {
-          // Try alternate endpoint
-          fetchCodexUsageFallback(config).then(resolve);
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          resolve({
+            error:
+              "Codex token expired or unauthorized. Run `codex auth login` and retry.",
+          });
           return;
         }
-        try {
-          const data = JSON.parse(body);
-          resolve(parseCodexRateLimits(data));
-        } catch (e) {
-          fetchCodexUsageFallback(config).then(resolve);
-        }
-      });
-    });
-    req.on("error", () => fetchCodexUsageFallback(config).then(resolve));
-    req.setTimeout(10000, () => {
-      req.destroy();
-      fetchCodexUsageFallback(config).then(resolve);
-    });
-    req.end();
-  });
-}
-
-function fetchCodexUsageFallback(config) {
-  return new Promise((resolve) => {
-    const cookies = config.codex_cookies;
-    const options = {
-      hostname: "chatgpt.com",
-      path: "/backend-api/accounts/check/v4-2023-04-27",
-      method: "GET",
-      headers: {
-        Cookie: cookies,
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        Accept: "application/json",
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let body = "";
-      res.on("data", (d) => (body += d));
-      res.on("end", () => {
         if (res.statusCode !== 200) {
           resolve({
-            error: `Codex API returned ${res.statusCode}. Cookies may have expired. Run with --setup to reconfigure.`,
+            error: `Codex usage API returned ${res.statusCode}`,
           });
           return;
         }
         try {
           const data = JSON.parse(body);
-          resolve(parseCodexAccountCheck(data));
+          resolve(
+            parseCodexWhamUsage({
+              ...data,
+              _credential_source: credentials.source,
+            })
+          );
         } catch (e) {
-          resolve({ error: `Failed to parse Codex response: ${e.message}` });
+          resolve({ error: `Failed to parse Codex usage: ${e.message}` });
         }
       });
     });
     req.on("error", (e) =>
-      resolve({ error: `Codex request failed: ${e.message}` })
+      resolve({ error: `Codex usage request failed: ${e.message}` })
     );
     req.setTimeout(10000, () => {
       req.destroy();
-      resolve({ error: "Codex request timed out" });
+      resolve({ error: "Codex usage request timed out" });
     });
     req.end();
   });
 }
 
-function parseCodexRateLimits(data) {
-  // The rate_limits endpoint returns structured data about 5h and weekly limits
-  const result = {
-    five_hour_used_pct: null,
-    five_hour_resets: null,
-    weekly_used_pct: null,
-    weekly_resets: null,
+function parseCodexWhamUsage(data) {
+  const toPct = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(0, Math.min(100, Math.round(n)));
+  };
+  const toLabel = (seconds, fallback) => {
+    const n = Number(seconds);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    const hours = Math.round(n / 3600);
+    return hours >= 24 ? "Day" : `${hours}h`;
   };
 
-  if (data && data.rate_limits) {
-    for (const limit of data.rate_limits) {
-      const windowHours = limit.window_seconds
-        ? limit.window_seconds / 3600
-        : null;
-      const pct =
-        limit.max_usage > 0
-          ? Math.round((limit.current_usage / limit.max_usage) * 100)
-          : null;
-      const resetAt = limit.reset_at
-        ? formatResetDate(new Date(limit.reset_at * 1000))
-        : null;
-
-      if (windowHours && windowHours <= 6) {
-        result.five_hour_used_pct = pct;
-        result.five_hour_resets = resetAt;
-      } else if (windowHours && windowHours >= 24 * 6) {
-        result.weekly_used_pct = pct;
-        result.weekly_resets = resetAt;
-      }
-    }
-  }
-  return result;
-}
-
-function parseCodexAccountCheck(data) {
-  // Fallback: extract what we can from the account check endpoint
   const result = {
+    primary_label: null,
+    primary_used_pct: null,
+    primary_resets: null,
+    secondary_label: null,
+    secondary_used_pct: null,
+    secondary_resets: null,
     five_hour_used_pct: null,
     five_hour_resets: null,
     weekly_used_pct: null,
     weekly_resets: null,
     plan: null,
+    credential_source: data?._credential_source ?? null,
   };
 
-  if (data?.accounts?.default?.plan_type) {
-    result.plan = data.accounts.default.plan_type;
+  const primary = data?.rate_limit?.primary_window;
+  const secondary = data?.rate_limit?.secondary_window;
+
+  if (primary) {
+    const seconds = Number(primary.limit_window_seconds);
+    const pct = toPct(primary.used_percent);
+    const reset = primary.reset_at
+      ? formatResetDate(new Date(primary.reset_at * 1000))
+      : null;
+
+    result.primary_label = toLabel(seconds, "Primary");
+    result.primary_used_pct = pct;
+    result.primary_resets = reset;
+
+    if (Number.isFinite(seconds) && seconds <= 6 * 3600) {
+      result.five_hour_used_pct = pct;
+      result.five_hour_resets = reset;
+    }
+    if (Number.isFinite(seconds) && seconds >= 6 * 24 * 3600) {
+      result.weekly_used_pct = pct;
+      result.weekly_resets = reset;
+    }
   }
 
-  // Look for rate limit info in various nested structures
-  const rl = data?.accounts?.default?.rate_limits;
-  if (rl) {
-    for (const [key, val] of Object.entries(rl)) {
-      if (key.includes("codex") || key.includes("5h") || key.includes("hour")) {
-        if (val.remaining != null && val.limit != null) {
-          result.five_hour_used_pct = Math.round(
-            ((val.limit - val.remaining) / val.limit) * 100
-          );
-        }
-        if (val.reset_at) {
-          result.five_hour_resets = formatResetDate(
-            new Date(val.reset_at * 1000)
-          );
-        }
-      }
-      if (key.includes("week")) {
-        if (val.remaining != null && val.limit != null) {
-          result.weekly_used_pct = Math.round(
-            ((val.limit - val.remaining) / val.limit) * 100
-          );
-        }
-        if (val.reset_at) {
-          result.weekly_resets = formatResetDate(
-            new Date(val.reset_at * 1000)
-          );
-        }
-      }
+  if (secondary) {
+    const seconds = Number(secondary.limit_window_seconds);
+    const pct = toPct(secondary.used_percent);
+    const reset = secondary.reset_at
+      ? formatResetDate(new Date(secondary.reset_at * 1000))
+      : null;
+
+    result.secondary_label = toLabel(seconds, "Secondary");
+    result.secondary_used_pct = pct;
+    result.secondary_resets = reset;
+
+    if (Number.isFinite(seconds) && seconds <= 6 * 3600) {
+      result.five_hour_used_pct = pct;
+      result.five_hour_resets = reset;
+    }
+    if (Number.isFinite(seconds) && seconds >= 6 * 24 * 3600) {
+      result.weekly_used_pct = pct;
+      result.weekly_resets = reset;
+    }
+  }
+
+  if (data?.plan_type) {
+    result.plan = String(data.plan_type);
+  }
+
+  if (data?.credits?.balance !== undefined && data?.credits?.balance !== null) {
+    const balance = Number(data.credits.balance);
+    if (Number.isFinite(balance)) {
+      result.plan = result.plan
+        ? `${result.plan} ($${balance.toFixed(2)})`
+        : `$${balance.toFixed(2)}`;
     }
   }
 
@@ -636,7 +707,7 @@ function displayCodex(data) {
   if (data.error) {
     console.log(`  ${RED}Error: ${data.error}${RESET}`);
     console.log(
-      `  ${DIM}Tip: Run /status inside an interactive Codex session to see usage${RESET}`
+      `  ${DIM}Tip: Run ${CYAN}codex auth login${RESET}${DIM} to refresh CLI OAuth credentials${RESET}`
     );
     return;
   }
@@ -645,22 +716,56 @@ function displayCodex(data) {
     console.log(`  ${DIM}Plan:${RESET} ${data.plan}`);
   }
 
-  console.log(
-    sectionRow(
-      "5-Hour   ",
-      data.five_hour_used_pct,
-      "Resets",
-      data.five_hour_resets
-    )
-  );
-  console.log(
-    sectionRow(
-      "Weekly   ",
-      data.weekly_used_pct,
-      "Resets",
-      data.weekly_resets
-    )
-  );
+  const primaryLabel = (data.primary_label || "Primary").padEnd(9, " ");
+  const secondaryLabel = (data.secondary_label || "Secondary").padEnd(9, " ");
+  const hasPrimary = data.primary_used_pct != null || data.primary_resets != null;
+  const hasSecondary = data.secondary_used_pct != null || data.secondary_resets != null;
+
+  if (hasPrimary) {
+    console.log(
+      sectionRow(
+        primaryLabel,
+        data.primary_used_pct,
+        "Resets",
+        data.primary_resets
+      )
+    );
+  } else {
+    console.log(
+      sectionRow(
+        "5-Hour   ",
+        data.five_hour_used_pct,
+        "Resets",
+        data.five_hour_resets
+      )
+    );
+  }
+
+  if (hasSecondary) {
+    console.log(
+      sectionRow(
+        secondaryLabel,
+        data.secondary_used_pct,
+        "Resets",
+        data.secondary_resets
+      )
+    );
+  } else {
+    console.log(
+      sectionRow(
+        "Weekly   ",
+        data.weekly_used_pct,
+        "Resets",
+        data.weekly_resets
+      )
+    );
+  }
+
+  if (data.credential_source) {
+    console.log(
+      `    ${DIM}Auth source:${RESET} ${CYAN}${data.credential_source}${RESET}`
+    );
+  }
 }
 
 function displayCursor(data) {
@@ -734,18 +839,13 @@ async function setup() {
 
   // Codex
   console.log(`${GREEN}${BOLD}Codex${RESET}`);
-  console.log(`  To get your session cookies:`);
-  console.log(`  1. Open ${CYAN}https://chatgpt.com/codex/settings/usage${RESET} in your browser`);
-  console.log(`  2. Open DevTools (F12) > Application > Cookies > chatgpt.com`);
   console.log(
-    `  3. Copy the full cookie string (or at minimum the session token)\n`
+    `  Uses Codex CLI OAuth credentials from your local Codex auth store/keychain.`
   );
-  const codexCookies = await ask(
-    `  Paste Codex cookies (or press Enter to skip): `
+  console.log(
+    `  Run ${CYAN}codex auth login${RESET} in a standalone terminal if usage fails.\n`
   );
-  if (codexCookies.trim()) {
-    config.codex_cookies = codexCookies.trim();
-  }
+  delete config.codex_cookies;
 
   // Cursor
   console.log(`\n${BLUE}${BOLD}Cursor${RESET}`);
@@ -792,12 +892,12 @@ ${DIM}Usage:${RESET}
   node usage.js --codex      Show Codex usage only
   node usage.js --cursor     Show Cursor usage only
   node usage.js --json       Output as JSON
-  node usage.js --setup      Configure API tokens/cookies
+  node usage.js --setup      Configure API tokens
   node usage.js --help       Show this help
 
 ${DIM}Services:${RESET}
   Claude Code   Uses expect to run /usage in the CLI (requires claude auth login)
-  Codex         Fetches from chatgpt.com API (requires session cookies)
+  Codex         Fetches wham usage using Codex CLI OAuth (requires codex auth login)
   Cursor        Fetches from cursor.com API (requires WorkosCursorSessionToken)
 `);
     return;
@@ -827,7 +927,7 @@ ${DIM}Services:${RESET}
     promises.claude = fetchClaudeUsage();
   }
   if (showAll || codexOnly) {
-    promises.codex = fetchCodexUsage(config);
+    promises.codex = fetchCodexUsage();
   }
   if (showAll || cursorOnly) {
     promises.cursor = fetchCursorUsage(config);
