@@ -1263,6 +1263,7 @@ async function setup() {
   console.log(
     `  Make sure you've run ${CYAN}claude auth login${RESET} in a standalone terminal.\n`
   );
+  delete config.claude_cookie_header;
 
   // Codex
   console.log(`${GREEN}${BOLD}Codex${RESET}`);
@@ -1314,6 +1315,8 @@ ${BOLD}AI Agent Usage Monitor${RESET}
 
 ${DIM}Usage:${RESET}
   node usage.js              Show usage for all configured services
+  node usage.js              Show usage for all services
+  node usage.js --skip-claude  Fast: Codex + Cursor only (~1s, skips Claude)
   node usage.js --claude     Show Claude Code usage only
   node usage.js --codex      Show Codex usage only
   node usage.js --cursor     Show Cursor usage only
@@ -1340,6 +1343,7 @@ ${DIM}Env overrides:${RESET}
 
   const config = loadConfig();
   const jsonMode = args.includes("--json");
+  const skipClaude = args.includes("--skip-claude");
   const claudeOnly = args.includes("--claude");
   const codexOnly = args.includes("--codex");
   const cursorOnly = args.includes("--cursor");
@@ -1370,7 +1374,7 @@ ${DIM}Env overrides:${RESET}
 
   const allPromises = [];
 
-  if (showAll || claudeOnly) {
+  if ((showAll && !skipClaude) || claudeOnly) {
     startedAtMs.claude = Date.now();
     allPromises.push(
       displayWhenReady("claude", fetchClaudeUsage(), displayClaude)

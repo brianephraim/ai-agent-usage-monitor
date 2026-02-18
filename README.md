@@ -54,7 +54,7 @@ Common keys:
 ## Environment Overrides
 
 - `CURSOR_ACCESS_TOKEN`: override Cursor token.
-- `CLAUDE_USAGE_TIMEOUT_MS`: override Claude collector timeout in milliseconds (default `20000`, allowed `5000` to `120000`).
+- `CLAUDE_USAGE_TIMEOUT_MS`: override Claude collector timeout in milliseconds (default `35000`, allowed `5000` to `120000`).
 
 ## Notes
 
