@@ -1351,47 +1351,51 @@ ${DIM}Env overrides:${RESET}
   }
 
   // Run fetches in parallel
-  const promises = {};
   const startedAtMs = {};
+  const results = {};
+
+  const displayWhenReady = (key, promise, displayFn) => {
+    const start = Date.now();
+    return promise.then((value) => {
+      const elapsedSeconds = Number(((Date.now() - start) / 1000).toFixed(2));
+      const data =
+        value && typeof value === "object" && !Array.isArray(value)
+          ? { ...value, elapsed_seconds: elapsedSeconds }
+          : { value, elapsed_seconds: elapsedSeconds };
+      results[key] = data;
+      if (!jsonMode && displayFn) displayFn(data);
+      return data;
+    });
+  };
+
+  const allPromises = [];
 
   if (showAll || claudeOnly) {
     startedAtMs.claude = Date.now();
-    promises.claude = fetchClaudeUsage();
+    allPromises.push(
+      displayWhenReady("claude", fetchClaudeUsage(), displayClaude)
+    );
   }
   if (showAll || codexOnly) {
     startedAtMs.codex = Date.now();
-    promises.codex = fetchCodexUsage();
+    allPromises.push(
+      displayWhenReady("codex", fetchCodexUsage(), displayCodex)
+    );
   }
   if (showAll || cursorOnly) {
     startedAtMs.cursor = Date.now();
-    promises.cursor = fetchCursorUsage(config);
+    allPromises.push(
+      displayWhenReady("cursor", fetchCursorUsage(config), displayCursor)
+    );
   }
 
-  const keys = Object.keys(promises);
-  const values = await Promise.all(Object.values(promises));
-  const results = {};
-  keys.forEach((k, i) => {
-    const elapsedSeconds = Number(
-      ((Date.now() - (startedAtMs[k] || Date.now())) / 1000).toFixed(2)
-    );
-    const value = values[i];
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      results[k] = { ...value, elapsed_seconds: elapsedSeconds };
-    } else {
-      results[k] = { value, elapsed_seconds: elapsedSeconds };
-    }
-  });
+  await Promise.all(allPromises);
 
   if (jsonMode) {
     outputJson(results.claude, results.codex, results.cursor);
-    return;
+  } else {
+    console.log(`\n${DIM}${"─".repeat(60)}${RESET}\n`);
   }
-
-  if (results.claude) displayClaude(results.claude);
-  if (results.codex) displayCodex(results.codex);
-  if (results.cursor) displayCursor(results.cursor);
-
-  console.log(`\n${DIM}${"─".repeat(60)}${RESET}\n`);
 }
 
 main().catch((err) => {
