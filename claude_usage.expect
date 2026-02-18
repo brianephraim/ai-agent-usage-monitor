@@ -46,17 +46,17 @@ send "/usage"
 set timeout 8
 expect {
   -re {Show.*plan|plan.*usage|usage.*limits} {
-    after 400
+    after 250
     send "\r"
   }
   timeout {
     # No autocomplete seen; send Enter anyway (minimal UI or fast env)
-    after 300
+    after 200
     send "\r"
   }
 }
 set timeout 15
-after 500
+after 250
 send "\r"
 
 # Wait until usage sections show up. Allow extra time for "Loading usage data…".
@@ -76,7 +76,7 @@ expect {
 set timeout 15
 
 # Allow trailing lines (e.g., week/extra usage and resets) to flush.
-after 700
+after 450
 
 # --- Phase 3: Fast shutdown ---
 # We only need the rendered usage text, so avoid long graceful-exit waits.
