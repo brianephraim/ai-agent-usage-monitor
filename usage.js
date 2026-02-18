@@ -455,48 +455,63 @@ function fetchCursorUsage(config) {
       return;
     }
 
-    fetchCursorApiJson(credentials.access_token, "/auth/usage").then(
-      (usageResponse) => {
-        if (usageResponse.error) {
-          resolve({ error: usageResponse.error });
-          return;
+    Promise.all([
+      fetchCursorDashboardJson(
+        credentials.access_token,
+        "GetCurrentPeriodUsage",
+        {}
+      ),
+      fetchCursorDashboardJson(credentials.access_token, "GetPlanInfo", {}),
+      fetchCursorApiJson(credentials.access_token, "/auth/full_stripe_profile"),
+      fetchCursorApiJson(credentials.access_token, "/auth/usage"),
+    ])
+      .then(
+        ([
+          dashboardUsageResponse,
+          dashboardPlanResponse,
+          profileResponse,
+          legacyUsageResponse,
+        ]) => {
+          const hasDashboardUsage =
+            !dashboardUsageResponse.error && dashboardUsageResponse.data;
+          const hasLegacyUsage =
+            !legacyUsageResponse.error && legacyUsageResponse.data;
+
+          if (!hasDashboardUsage && !hasLegacyUsage) {
+            resolve({
+              error:
+                dashboardUsageResponse.error ||
+                legacyUsageResponse.error ||
+                "Cursor usage is unavailable",
+            });
+            return;
+          }
+
+          const parsed = hasDashboardUsage
+            ? parseCursorUsage(dashboardUsageResponse.data)
+            : parseCursorUsage(legacyUsageResponse.data);
+          parsed.auth_source = credentials.source;
+
+          if (hasDashboardUsage && hasLegacyUsage) {
+            mergeCursorUsage(parsed, parseCursorUsage(legacyUsageResponse.data));
+          }
+
+          applyCursorCredentialMetadata(parsed, credentials);
+
+          if (!dashboardPlanResponse.error && dashboardPlanResponse.data) {
+            applyCursorPlanInfo(parsed, dashboardPlanResponse.data);
+          }
+
+          if (!profileResponse.error && profileResponse.data) {
+            applyCursorStripeProfile(parsed, profileResponse.data);
+          }
+
+          resolve(parsed);
         }
-
-        const parsed = parseCursorUsage(usageResponse.data);
-        parsed.auth_source = credentials.source;
-
-        if (credentials.membership_type) {
-          parsed.plan = String(credentials.membership_type);
-        }
-        if (credentials.subscription_status) {
-          parsed.subscription_status = String(credentials.subscription_status);
-        }
-
-        fetchCursorApiJson(credentials.access_token, "/auth/full_stripe_profile")
-          .then((profileResponse) => {
-            if (!profileResponse.error && profileResponse.data) {
-              const profile = profileResponse.data;
-              const membership =
-                profile.membershipType || profile.individualMembershipType;
-              const details = [];
-              if (profile.isYearlyPlan) details.push("yearly");
-              if (profile.isOnStudentPlan) details.push("student");
-
-              if (membership) {
-                parsed.plan =
-                  details.length > 0
-                    ? `${membership} ${details.join(" ")}`
-                    : String(membership);
-              }
-              if (profile.subscriptionStatus) {
-                parsed.subscription_status = String(profile.subscriptionStatus);
-              }
-            }
-            resolve(parsed);
-          })
-          .catch(() => resolve(parsed));
-      }
-    );
+      )
+      .catch((e) =>
+        resolve({ error: `Failed to fetch Cursor usage: ${e.message}` })
+      );
   });
 }
 
@@ -632,19 +647,188 @@ function fetchCursorApiJson(accessToken, apiPath) {
   });
 }
 
+function fetchCursorDashboardJson(accessToken, methodName, payload = {}) {
+  return new Promise((resolve) => {
+    const apiPath = `/aiserver.v1.DashboardService/${methodName}`;
+    const body = JSON.stringify(payload || {});
+    const options = {
+      hostname: "api2.cursor.sh",
+      path: apiPath,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": "ai-agent-usage-monitor",
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let responseBody = "";
+      res.on("data", (d) => (responseBody += d));
+      res.on("end", () => {
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          resolve({
+            error:
+              "Cursor auth token expired or unauthorized. Open Cursor and sign in again.",
+          });
+          return;
+        }
+        if (res.statusCode !== 200) {
+          resolve({
+            error: `Cursor API ${apiPath} returned ${res.statusCode}`,
+          });
+          return;
+        }
+        try {
+          resolve({ data: JSON.parse(responseBody) });
+        } catch (e) {
+          resolve({ error: `Failed to parse Cursor API ${apiPath}: ${e.message}` });
+        }
+      });
+    });
+    req.on("error", (e) =>
+      resolve({ error: `Cursor API ${apiPath} request failed: ${e.message}` })
+    );
+    req.setTimeout(10000, () => {
+      req.destroy();
+      resolve({ error: `Cursor API ${apiPath} request timed out` });
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+function applyCursorCredentialMetadata(parsed, credentials) {
+  if (credentials.membership_type && !parsed.plan) {
+    parsed.plan = String(credentials.membership_type);
+  }
+  if (credentials.subscription_status && !parsed.subscription_status) {
+    parsed.subscription_status = String(credentials.subscription_status);
+  }
+}
+
+function applyCursorPlanInfo(parsed, planInfoResponse) {
+  const planInfo = planInfoResponse?.planInfo;
+  if (!planInfo || typeof planInfo !== "object") return;
+
+  const planParts = [];
+  if (planInfo.planName) planParts.push(String(planInfo.planName));
+  if (planInfo.price) planParts.push(String(planInfo.price));
+  if (planParts.length > 0) {
+    parsed.plan = planParts.join(" ");
+  }
+
+  const billingCycleEnd = Number(planInfo.billingCycleEnd);
+  if (Number.isFinite(billingCycleEnd) && billingCycleEnd > 0) {
+    parsed.monthly_resets = formatResetDate(new Date(billingCycleEnd));
+  }
+}
+
+function applyCursorStripeProfile(parsed, profile) {
+  const membership = profile.membershipType || profile.individualMembershipType;
+  const details = [];
+  if (profile.isYearlyPlan) details.push("yearly");
+  if (profile.isOnStudentPlan) details.push("student");
+
+  if (membership && !parsed.plan) {
+    parsed.plan =
+      details.length > 0
+        ? `${membership} ${details.join(" ")}`
+        : String(membership);
+  }
+  if (profile.subscriptionStatus) {
+    parsed.subscription_status = String(profile.subscriptionStatus);
+  }
+}
+
+function mergeCursorUsage(target, source) {
+  for (const [key, value] of Object.entries(source || {})) {
+    if (value === null || value === undefined) continue;
+    if (target[key] === null || target[key] === undefined) {
+      target[key] = value;
+    }
+  }
+  return target;
+}
+
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toRoundedPercent(value) {
+  const n = toFiniteNumber(value);
+  return n === null ? null : Math.round(n);
+}
+
 function parseCursorUsage(data) {
   const result = {
+    total_used_pct: null,
+    auto_used_pct: null,
     composer_used: null,
     composer_limit: null,
     composer_used_pct: null,
     api_used: null,
     api_limit: null,
     api_used_pct: null,
+    total_spend_cents: null,
+    included_spend_cents: null,
+    included_limit_cents: null,
+    bonus_spend_cents: null,
+    on_demand_limit_cents: null,
+    on_demand_remaining_cents: null,
+    on_demand_used_cents: null,
     monthly_resets: null,
     plan: null,
     subscription_status: null,
     auth_source: null,
   };
+
+  if (!data || typeof data !== "object") {
+    return result;
+  }
+
+  // DashboardService/GetCurrentPeriodUsage shape (matches Cursor Plan & Usage UI)
+  if (data.planUsage && typeof data.planUsage === "object") {
+    const planUsage = data.planUsage;
+    result.total_used_pct = toRoundedPercent(planUsage.totalPercentUsed);
+    result.auto_used_pct = toRoundedPercent(planUsage.autoPercentUsed);
+    result.api_used_pct = toRoundedPercent(planUsage.apiPercentUsed);
+    result.total_spend_cents = toFiniteNumber(planUsage.totalSpend);
+    result.included_spend_cents = toFiniteNumber(planUsage.includedSpend);
+    result.included_limit_cents = toFiniteNumber(planUsage.limit);
+    result.bonus_spend_cents = toFiniteNumber(planUsage.bonusSpend);
+
+    if (result.auto_used_pct != null && result.composer_used_pct == null) {
+      result.composer_used_pct = result.auto_used_pct;
+    }
+  }
+
+  if (data.spendLimitUsage && typeof data.spendLimitUsage === "object") {
+    const spendLimitUsage = data.spendLimitUsage;
+    result.on_demand_limit_cents = toFiniteNumber(spendLimitUsage.individualLimit);
+    result.on_demand_remaining_cents = toFiniteNumber(
+      spendLimitUsage.individualRemaining
+    );
+    if (
+      result.on_demand_limit_cents != null &&
+      result.on_demand_remaining_cents != null
+    ) {
+      result.on_demand_used_cents = Math.max(
+        0,
+        result.on_demand_limit_cents - result.on_demand_remaining_cents
+      );
+    }
+  }
+
+  if (data.billingCycleEnd) {
+    const endEpochMs = Number(data.billingCycleEnd);
+    if (Number.isFinite(endEpochMs) && endEpochMs > 0) {
+      result.monthly_resets = formatResetDate(new Date(endEpochMs));
+    }
+  }
 
   // The Cursor usage API can return various structures
   // Common fields: numRequests, numRequestsTotal, maxRequestUsage, startOfMonth
@@ -697,6 +881,7 @@ function parseCursorUsage(data) {
   if (
     result.composer_used == null &&
     result.api_used == null &&
+    result.total_used_pct == null &&
     Object.keys(data).length > 0
   ) {
     result._raw_keys = Object.keys(data);
@@ -721,6 +906,13 @@ function parseCursorUsage(data) {
       nextMonth.setMonth(nextMonth.getMonth() + 1);
       result.monthly_resets = formatResetDate(nextMonth);
     }
+  }
+
+  if (result.total_used_pct == null && result.composer_used_pct != null) {
+    result.total_used_pct = result.composer_used_pct;
+  }
+  if (result.auto_used_pct == null && result.composer_used_pct != null) {
+    result.auto_used_pct = result.composer_used_pct;
   }
 
   return result;
@@ -750,6 +942,12 @@ function formatResetDate(date) {
   if (mins > 0) parts.push(`${mins}m`);
 
   return `${datePart} (${parts.join(" ")})`;
+}
+
+function formatUsdFromCents(cents) {
+  const n = Number(cents);
+  if (!Number.isFinite(n)) return null;
+  return `$${(n / 100).toFixed(2)}`;
 }
 
 // ─── Display ─────────────────────────────────────────────────────────────────
@@ -880,28 +1078,25 @@ function displayCursor(data) {
     );
   }
 
-  const composerLabel = data.composer_model
-    ? `Composer (${data.composer_model})`
-    : "Composer ";
-
-  const composerDetail =
-    data.composer_used != null && data.composer_limit != null
-      ? ` (${data.composer_used} / ${data.composer_limit} requests)`
-      : "";
+  const totalPct = data.total_used_pct ?? data.composer_used_pct;
+  const autoPct = data.auto_used_pct ?? data.composer_used_pct;
 
   console.log(
     sectionRow(
-      composerLabel,
-      data.composer_used_pct,
+      "Total    ",
+      totalPct,
       "Monthly reset",
       data.monthly_resets
     )
   );
-  if (composerDetail) {
-    console.log(`    ${DIM}Requests:${RESET}${composerDetail}`);
+
+  if (autoPct != null) {
+    console.log(
+      sectionRow("Auto     ", autoPct, "Monthly reset", data.monthly_resets)
+    );
   }
 
-  if (data.api_used_pct != null || data.api_used != null) {
+  if (data.api_used_pct != null || data.api_used != null || data.api_limit != null) {
     const apiDetail =
       data.api_used != null && data.api_limit != null
         ? ` (${data.api_used} / ${data.api_limit} requests)`
@@ -917,6 +1112,27 @@ function displayCursor(data) {
     if (apiDetail) {
       console.log(`    ${DIM}Requests:${RESET}${apiDetail}`);
     }
+  }
+
+  const includedUsed = formatUsdFromCents(data.included_spend_cents);
+  const includedLimit = formatUsdFromCents(data.included_limit_cents);
+  if (includedUsed || includedLimit) {
+    console.log(
+      `    ${DIM}Included:${RESET} ${includedUsed || "?"} / ${includedLimit || "?"}`
+    );
+  }
+
+  const bonusSpend = formatUsdFromCents(data.bonus_spend_cents);
+  if (bonusSpend && Number(data.bonus_spend_cents) > 0) {
+    console.log(`    ${DIM}Bonus:${RESET} ${bonusSpend}`);
+  }
+
+  const onDemandUsed = formatUsdFromCents(data.on_demand_used_cents);
+  const onDemandLimit = formatUsdFromCents(data.on_demand_limit_cents);
+  if (onDemandUsed || onDemandLimit) {
+    console.log(
+      `    ${DIM}On-demand:${RESET} ${onDemandUsed || "?"} / ${onDemandLimit || "?"}`
+    );
   }
 }
 
@@ -1001,7 +1217,7 @@ ${DIM}Usage:${RESET}
 ${DIM}Services:${RESET}
   Claude Code   Uses expect to run /usage in the CLI (requires claude auth login)
   Codex         Fetches wham usage using Codex CLI OAuth (requires codex auth login)
-  Cursor        Fetches from api2.cursor.sh/auth/usage using Cursor desktop auth (or CURSOR_ACCESS_TOKEN)
+  Cursor        Fetches Plan & Usage via api2.cursor.sh DashboardService using Cursor desktop auth (or CURSOR_ACCESS_TOKEN)
 `);
     return;
   }
