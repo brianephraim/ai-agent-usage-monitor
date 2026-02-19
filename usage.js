@@ -490,7 +490,7 @@ function parseCodexWhamUsage(data) {
     const n = Number(seconds);
     if (!Number.isFinite(n) || n <= 0) return fallback;
     const hours = Math.round(n / 3600);
-    return hours >= 24 ? "Day" : `${hours}h`;
+    return hours >= 24 ? "Week" : `${hours}h`;
   };
 
   const result = {
@@ -1369,6 +1369,223 @@ function displayCursor(data) {
   }
 }
 
+// ─── Antigravity: fetch via local file or API ─────────────────────────────────
+async function fetchAntigravityUsage(config) {
+  // 1. Try fetching via API (gcloud auth)
+  const apiData = await fetchAntigravityFromApi();
+  if (apiData) {
+    return apiData;
+  }
+
+  return new Promise((resolve) => {
+    // 1. Env override
+    if (process.env.ANTIGRAVITY_USAGE_FILE) {
+      if (fs.existsSync(process.env.ANTIGRAVITY_USAGE_FILE)) {
+        try {
+          const raw = fs.readFileSync(process.env.ANTIGRAVITY_USAGE_FILE, "utf8");
+          resolve(parseAntigravityUsage(JSON.parse(raw)));
+          return;
+        } catch (e) {
+          resolve({ error: `Failed to parse ANTIGRAVITY_USAGE_FILE: ${e.message}` });
+          return;
+        }
+      }
+    }
+
+    // 2. Default location: ~/.antigravity/usage.json
+    const defaultPath = path.join(os.homedir(), ".antigravity", "usage.json");
+    if (fs.existsSync(defaultPath)) {
+      try {
+        const raw = fs.readFileSync(defaultPath, "utf8");
+        resolve(parseAntigravityUsage(JSON.parse(raw)));
+        return;
+      } catch (e) {
+        resolve({ error: `Failed to parse ~/.antigravity/usage.json: ${e.message}` });
+        return;
+      }
+    }
+
+    // 3. Fallback: check config
+    if (config.antigravity_usage_file) {
+      if (fs.existsSync(config.antigravity_usage_file)) {
+        try {
+          const raw = fs.readFileSync(config.antigravity_usage_file, "utf8");
+          resolve(parseAntigravityUsage(JSON.parse(raw)));
+          return;
+        } catch (e) {
+          resolve({ error: `Failed to parse config.antigravity_usage_file: ${e.message}` });
+          return;
+        }
+      }
+    }
+
+    // No file found
+    resolve({
+      error: "No usage file found at ANTIGRAVITY_USAGE_FILE or ~/.antigravity/usage.json",
+    });
+  });
+}
+
+function fetchAntigravityFromApi() {
+  return new Promise((resolve) => {
+    // Check if gcloud is available
+    const gcloud = spawn("gcloud", ["auth", "print-access-token"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let token = "";
+    let error = "";
+
+    gcloud.stdout.on("data", (data) => {
+      token += data.toString();
+    });
+
+    gcloud.stderr.on("data", (data) => {
+      error += data.toString();
+    });
+
+    gcloud.on("error", () => {
+      resolve(null); // gcloud not found or error
+    });
+
+    gcloud.on("close", (code) => {
+      if (code !== 0 || !token.trim()) {
+        resolve(null);
+        return;
+      }
+
+      const accessToken = token.trim();
+      const postData = JSON.stringify({});
+
+      const options = {
+        hostname: "cloudcode-pa.googleapis.com",
+        path: "/v1internal:fetchAvailableModels",
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "User-Agent": "antigravity", // Act like the extension
+          "Content-Length": Buffer.byteLength(postData),
+        },
+      };
+
+      const req = https.request(options, (res) => {
+        let body = "";
+        res.on("data", (chunk) => body += chunk);
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            resolve(null);
+            return;
+          }
+          try {
+            const data = JSON.parse(body);
+            resolve(parseAntigravityApiData(data));
+          } catch (e) {
+            resolve(null);
+          }
+        });
+      });
+
+      req.on("error", () => resolve(null));
+      req.write(postData);
+      req.end();
+    });
+  });
+}
+
+function parseAntigravityApiData(data) {
+  if (!data || !data.models) return null;
+
+  // Find a model with quota info
+  let bestModel = null;
+  // Try to find gemini-2.0-pro-exp-02-05 first as it's a common defaults
+  // Or just iterate and pick the first one with quotaInfo
+
+  const commonModels = ["gemini-2.0-pro-exp-02-05", "gemini-1.5-pro", "gemini-ultra"];
+
+  for (const modelId of commonModels) {
+    if (data.models[modelId] && data.models[modelId].quotaInfo) {
+      bestModel = data.models[modelId];
+      break;
+    }
+  }
+
+  if (!bestModel) {
+    for (const key in data.models) {
+      if (data.models[key].quotaInfo) {
+        bestModel = data.models[key];
+        break;
+      }
+    }
+  }
+
+  if (!bestModel) return null;
+
+  const quota = bestModel.quotaInfo;
+  const remainingFraction = quota.remainingFraction ?? 1;
+  const usedPercent = Math.round((1 - remainingFraction) * 100);
+
+  return {
+    used_percent: usedPercent,
+    limit: "Quota", // Label as Quota since it's usage based
+    reset_at: quota.resetTime || null,
+    reset_at_ms: quota.resetTime ? new Date(quota.resetTime).getTime() : null
+  };
+}
+
+function parseAntigravityUsage(data) {
+  const result = {
+    used_percent: null,
+    limit: null,
+    reset_at: null,
+    reset_at_ms: null,
+  };
+
+  if (!data || typeof data !== "object") return result;
+
+  if (data.used_percent != null) {
+    result.used_percent = Number(data.used_percent);
+  }
+  if (data.limit != null) {
+    result.limit = String(data.limit);
+  }
+  if (data.reset_at) {
+    const d = new Date(data.reset_at);
+    if (!isNaN(d.getTime())) {
+      result.reset_at = formatResetDate(d);
+      result.reset_at_ms = d.getTime();
+    }
+  }
+
+  return result;
+}
+
+function displayAntigravity(data) {
+  console.log(
+    heading(
+      `${CYAN}  Antigravity${RESET}${formatElapsedSeconds(data.elapsed_seconds)}`
+    )
+  );
+
+  if (data.error) {
+    console.log(`  ${RED}Error: ${data.error}${RESET}`);
+    return;
+  }
+
+  console.log(
+    sectionRow(
+      "Usage    ",
+      data.used_percent,
+      "Reset",
+      data.reset_at
+    )
+  );
+
+  if (data.limit) {
+    console.log(`  ${DIM}Limit:${RESET} ${data.limit}`);
+  }
+}
+
 // ─── Setup wizard ────────────────────────────────────────────────────────────
 async function setup() {
   const readline = require("readline");
@@ -1423,11 +1640,12 @@ async function setup() {
 }
 
 // ─── JSON mode ───────────────────────────────────────────────────────────────
-function outputJson(claude, codex, cursor) {
+function outputJson(claude, codex, cursor, antigravity) {
   const result = {};
   if (claude) result.claude = claude;
   if (codex) result.codex = codex;
   if (cursor) result.cursor = cursor;
+  if (antigravity) result.antigravity = antigravity;
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -1446,6 +1664,7 @@ ${DIM}Usage:${RESET}
   node usage.js --claude     Show Claude Code usage only
   node usage.js --codex      Show Codex usage only
   node usage.js --cursor     Show Cursor usage only
+  node usage.js --antigravity Show Antigravity usage only
   node usage.js --json       Output as JSON
   node usage.js --setup      Configure API tokens
   node usage.js --help       Show this help
@@ -1473,7 +1692,8 @@ ${DIM}Env overrides:${RESET}
   const claudeOnly = args.includes("--claude");
   const codexOnly = args.includes("--codex");
   const cursorOnly = args.includes("--cursor");
-  const showAll = !claudeOnly && !codexOnly && !cursorOnly;
+  const antigravityOnly = args.includes("--antigravity");
+  const showAll = !claudeOnly && !codexOnly && !cursorOnly && !antigravityOnly;
 
   if (!jsonMode) {
     console.log(`\n${BOLD}${WHITE}  AI Agent Usage Monitor${RESET}`);
@@ -1518,11 +1738,21 @@ ${DIM}Env overrides:${RESET}
       displayWhenReady("cursor", fetchCursorUsage(config), displayCursor)
     );
   }
+  if (showAll || antigravityOnly) {
+    startedAtMs.antigravity = Date.now();
+    allPromises.push(
+      displayWhenReady(
+        "antigravity",
+        fetchAntigravityUsage(config),
+        displayAntigravity
+      )
+    );
+  }
 
   await Promise.all(allPromises);
 
   if (jsonMode) {
-    outputJson(results.claude, results.codex, results.cursor);
+    outputJson(results.claude, results.codex, results.cursor, results.antigravity);
   } else {
     console.log(`\n${DIM}${"─".repeat(60)}${RESET}\n`);
   }
